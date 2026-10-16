@@ -1,0 +1,6 @@
+{
+  "name": "claude-lean",
+  "owner": { "name": "noodleTownHQ" },
+  "description": "lean: a Claude Code mod with oh-my-pi-style token savers",
+  "plugins": [{ "name": "lean", "source": "./" }]
+}

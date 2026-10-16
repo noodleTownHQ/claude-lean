@@ -1,0 +1,36 @@
+{
+  "name": "lean",
+  "version": "0.2.0",
+  "description": "omp-style token savers: hashline edits, trimmed tool output, a Haiku scout agent, optional push and mount guards, and a /lean report",
+  "author": {
+    "name": "noodleTownHQ"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "trimChars": {
+      "type": "number",
+      "title": "Trim output over (characters)",
+      "description": "Bash and Grep output longer than this keeps its head and tail; the full text is saved to a file",
+      "default": 10000
+    },
+    "protectBranch": {
+      "type": "string",
+      "title": "Protected branch",
+      "description": "Refuse git pushes to this branch (for example main, where a push deploys). Empty turns the guard off",
+      "default": ""
+    },
+    "pushNote": {
+      "type": "string",
+      "title": "Why the branch is protected",
+      "description": "Shown to Claude when a push is refused, for example: a push to main deploys",
+      "default": ""
+    },
+    "mountGuardPath": {
+      "type": "string",
+      "title": "Compose folder to guard",
+      "description": "Refuse single-file bind mounts in YAML files whose path contains this, for example deploy/compose/. Empty turns the guard off",
+      "default": ""
+    }
+  }
+}
