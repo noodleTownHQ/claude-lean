@@ -1,13 +1,25 @@
 {
   "name": "lean",
-  "version": "0.2.0",
-  "description": "omp-style token savers: hashline edits, trimmed tool output, a Haiku scout agent, optional push and mount guards, and a /lean report",
+  "version": "0.3.0",
+  "description": "omp-style token savers and guards: hashline edits, trimmed tool output, a Haiku scout agent, checks after each edit, pattern rules, push and mount guards, and a /lean report",
   "author": {
     "name": "noodleTownHQ"
   },
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
+    "diagnostics": {
+      "type": "boolean",
+      "title": "Check files after each edit",
+      "description": "After Edit, Write or HashEdit, run a fast checker for the file type (ruff for Python syntax and undefined names, bash -n, JSON parse) and hand Claude any errors",
+      "default": true
+    },
+    "rulesFile": {
+      "type": "string",
+      "title": "Rules file",
+      "description": "Absolute path to a JSON array of pattern rules applied to every tool call (a project's .claude/lean-rules.json is read too). Empty: project rules only",
+      "default": ""
+    },
     "trimChars": {
       "type": "number",
       "title": "Trim output over (characters)",

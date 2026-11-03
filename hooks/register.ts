@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, TurnUsage } from 'claude-code'
 
 import type { SessionStats, Tally } from '../types'
-import { addedFileMounts, isGuardedYaml, planEdit, pushesBranch, tagLines, trimMiddle } from './lib'
-import type { HashEditOp } from './lib'
+import { addedFileMounts, checkerFor, isGuardedYaml, matchRules, parseRules, planEdit, pushesBranch, tagLines, trimMiddle } from './lib'
+import type { HashEditOp, LoadedRule } from './lib'
 
 // Output past `trimChars` (default 10,000) keeps 40% head and 30% tail; the full text goes to OUT_DIR.
 const OUT_DIR = '/tmp/claude-lean'
@@ -39,6 +39,19 @@ const failEdit = async ($: EngineInterface, why: string) => {
   return { deny: why }
 }
 
+// Runs the file type's checker after a write; text for the model when it found problems, else undefined.
+// A checker that is not installed, or times out, stays silent.
+const diagnose = async ($: EngineInterface, path: string): Promise<string | undefined> => {
+  const argv = checkerFor(path)
+  if (!argv) return undefined
+  const r = await $.process.run(argv, { timeoutMs: 15_000 }).catch(() => undefined)
+  if (!r || r.exitCode === 0) return undefined
+  const out = `${r.stdout}\n${r.stderr}`.trim().slice(0, 2_000)
+  return `lean: ${argv[0]} found problems in ${path} after this change; fix them before moving on:\n${out}`
+}
+
+const ruleNote = (r: LoadedRule) => `lean rule${r.name ? ` "${r.name}"` : ''}: ${r.rule}`
+
 const SCOUT_PROMPT = `You are a fast, read-only scout. Find what you were asked to find and report it tersely:
 - one line per hit: path:line, then a few words on what is there
 - then a one to three sentence answer to the question
@@ -63,12 +76,23 @@ export const register: Register = (on, options) => {
   const LIMIT = Math.max(2_000, Number(options.trimChars ?? 10_000) || 10_000)
   const HEAD = Math.round(LIMIT * 0.4)
   const TAIL = Math.round(LIMIT * 0.3)
+  const rulesFile = String(options.rulesFile ?? '').trim()
+  const checks = options.diagnostics !== false
   let hashOn = true
   let cwd = ''
+  let rules: LoadedRule[] = []
 
   on('session.start', async ($, e, next) => {
     hashOn = ((await $.store.get('hashline')) ?? true) === true
     cwd = e.cwd
+
+    // Your rules file, then the project's own .claude/lean-rules.json.
+    const files = [rulesFile, `${cwd.replace(/\/$/, '')}/.claude/lean-rules.json`].filter(Boolean)
+    rules = []
+    for (const f of files) {
+      const text = await $.fs.read(f).catch(() => undefined)
+      if (typeof text === 'string') rules.push(...parseRules(text))
+    }
 
     await $.command.register({
       name: 'lean',
@@ -206,6 +230,36 @@ export const register: Register = (on, options) => {
     return mountDeny(found)
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'lean: its compose guard failed' }))
 
+  // Pattern rules (omp's TTSR, at the tool call): a match blocks the call, or runs it and hands the rule along.
+  on('tool.call', async ($, e, next) => {
+    if (rules.length === 0) return next(e)
+    const hits = matchRules(rules, e.tool, e as unknown as Record<string, unknown>)
+    if (hits.length === 0) return next(e)
+    await bump($, s => ({ ...s, guards: s.guards + 1 }))
+    const blocking = hits.filter(r => r.block === true)
+    if (blocking.length > 0) return { deny: `${blocking.map(ruleNote).join('\n')}\nRework the call to follow the rule.` }
+    const ran = await next(e)
+    if (ran.deny !== undefined || ran.isError === true) return ran
+    return { ...ran, context: [...(ran.context ?? []), ...hits.map(ruleNote)] }
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'lean: its rule check failed' }))
+
+  // Diagnostics after a write: the checker's errors arrive with the tool's result.
+  if (checks) {
+    on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
+      const ran = await next(e)
+      if (ran.deny !== undefined || ran.isError === true) return ran
+      const note = await diagnose($, e.file_path)
+      return note === undefined ? ran : { ...ran, context: [...(ran.context ?? []), note] }
+    }).catch(($, e, next) => next(e))
+
+    on('tool.call', { tool: 'Write' }, async ($, e, next) => {
+      const ran = await next(e)
+      if (ran.deny !== undefined || ran.isError === true) return ran
+      const note = await diagnose($, e.file_path)
+      return note === undefined ? ran : { ...ran, context: [...(ran.context ?? []), note] }
+    }).catch(($, e, next) => next(e))
+  }
+
   on('tool.call', { tool: HASH_READ }, async ($, e) => {
     const args = e as unknown as { path: string; offset?: number; limit?: number }
     const file_path = await absolute($, args.path)
@@ -251,8 +305,10 @@ export const register: Register = (on, options) => {
     }))
 
     const shift = plan.delta === 0 ? '' : ` Lines below ${plan.last + 1} moved by ${plan.delta > 0 ? '+' : ''}${plan.delta}; their old anchors are stale.`
+    // A nested Edit's context does not reach the model, so diagnostics go in the result itself.
+    const note = checks ? await diagnose($, file_path) : undefined
     return {
-      result: `Edited ${file_path}.${shift} Fresh anchors for the edited region:\n${tagLines(plan.newRegion.join('\n'), plan.first + 1)}`,
+      result: `Edited ${file_path}.${shift} Fresh anchors for the edited region:\n${tagLines(plan.newRegion.join('\n'), plan.first + 1)}${note ? `\n\n${note}` : ''}`,
     }
   })
 

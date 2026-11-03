@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { addedFileMounts, hashLine, isGuardedYaml, planEdit, pushesBranch, tagLines, trimMiddle } from '../hooks/lib'
+import { addedFileMounts, checkerFor, hashLine, isGuardedYaml, matchRules, parseRules, planEdit, pushesBranch, tagLines, trimMiddle } from '../hooks/lib'
 
 const FILE = 'alpha\nbeta\ngamma\ndelta\n'
 const at = (n: number) => `${n}:${hashLine(FILE.split('\n')[n - 1]!)}`
@@ -157,5 +157,85 @@ describe('hooks', () => {
     expect(String((done as { result?: unknown }).result)).toContain('Edited /repo/a.txt')
     expect(edits.length).toBe(1)
     expect(FILE.replace(edits[0]!.old_string, edits[0]!.new_string)).toBe('alpha\nbeta\nGAMMA\ndelta\n')
+  })
+})
+
+describe('pattern rules and checks', () => {
+  const RULES = JSON.stringify([
+    { name: 'no-latest', match: ':latest\\b', rule: 'Pin images to a sha tag, never :latest.', block: true },
+    { tool: 'Bash', match: '\\bnpm install\\b', rule: 'This repo uses pnpm.' },
+    { match: '(', rule: 'a bad regex, dropped' },
+    { rule: 'no match field, dropped' },
+  ])
+
+  test('parseRules keeps valid rules only', () => {
+    expect(parseRules(RULES).map(r => r.name ?? r.rule)).toEqual(['no-latest', 'This repo uses pnpm.'])
+    expect(parseRules('not json')).toEqual([])
+    expect(parseRules('{}')).toEqual([])
+  })
+
+  test('matchRules looks at what a call runs or writes, and honours `tool`', () => {
+    const rules = parseRules(RULES)
+    expect(matchRules(rules, 'Edit', { new_string: 'image: foo:latest' }).map(r => r.name)).toEqual(['no-latest'])
+    expect(matchRules(rules, 'Bash', { command: 'npm install x' })).toHaveLength(1)
+    expect(matchRules(rules, 'Write', { content: 'npm install x' })).toHaveLength(0)
+    expect(matchRules(rules, 'mcp__lean__HashEdit', { edits: [{ text: 'a:latest' }] })).toHaveLength(1)
+  })
+
+  test('checkerFor picks a checker by extension', () => {
+    expect(checkerFor('/a/b.py')?.[0]).toBe('ruff')
+    expect(checkerFor('x.sh')).toEqual(['bash', '-n', 'x.sh'])
+    expect(checkerFor('x.json')?.[0]).toBe('python3')
+    expect(checkerFor('x.ts')).toBeUndefined()
+  })
+
+  test('a blocking rule refuses the call', { options: { rulesFile: '/home/rules.json' } }, async ($, on) => {
+    world(on, { '/home/rules.json': RULES }, {})
+    let ran = false
+    on('tool.call', { tool: 'Bash' }, () => {
+      ran = true
+      return { result: { stdout: '', stderr: '', interrupted: false } }
+    })
+    await $.session.start(START)
+    const r = await $.tool.call({ tool: 'Bash', command: 'docker pull foo:latest' })
+    expect(r.deny ?? (r.isError === true ? r.text : undefined)).toContain('Pin images to a sha tag')
+    expect(ran).toBe(false)
+  })
+
+  test("a project's advisory rule runs the call and hands the rule along", async ($, on) => {
+    world(on, { '/repo/.claude/lean-rules.json': RULES }, {})
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: 'ok', stderr: '', interrupted: false } }))
+    await $.session.start(START)
+    const r = await $.tool.call({ tool: 'Bash', command: 'npm install left-pad' })
+    expect(r.deny).toBeUndefined()
+    expect((r as { context?: readonly string[] }).context?.join('\n') ?? '').toContain('uses pnpm')
+  })
+
+  test('an Edit to a Python file with errors hands back the checker output', async ($, on) => {
+    world(on, {}, {})
+    on('tool.call', { tool: 'Edit' }, ($, e) => ({
+      result: { filePath: e.file_path, oldString: e.old_string, newString: e.new_string, originalFile: 'x', structuredPatch: [], userModified: false, replaceAll: false },
+    }))
+    on('process.run', ($, e) => ({
+      value: { exitCode: 1, stdout: `${e.argv.at(-1)}:1:1: F821 Undefined name \`foo\``, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }))
+    await $.session.start(START)
+    const r = await $.tool.call({ tool: 'Edit', file_path: '/repo/a.py', old_string: 'x', new_string: 'foo()' })
+    expect((r as { context?: readonly string[] }).context?.join('\n') ?? '').toContain('F821')
+  })
+
+  test('diagnostics off: no checker runs', { options: { diagnostics: false } }, async ($, on) => {
+    world(on, {}, {})
+    on('tool.call', { tool: 'Edit' }, ($, e) => ({
+      result: { filePath: e.file_path, oldString: e.old_string, newString: e.new_string, originalFile: 'x', structuredPatch: [], userModified: false, replaceAll: false },
+    }))
+    let runs = 0
+    on('process.run', () => {
+      runs++
+      return { value: { exitCode: 1, stdout: 'bad', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    await $.session.start(START)
+    await $.tool.call({ tool: 'Edit', file_path: '/repo/a.py', old_string: 'x', new_string: 'y' })
+    expect(runs).toBe(0)
   })
 })

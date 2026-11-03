@@ -178,3 +178,40 @@ export const addedFileMounts = (newText: string, oldText: string): string[] => {
   }
   return found
 }
+
+// A fast checker for the file's type: syntax errors and undefined names only, so a file's old lint debt
+// does not echo after every edit. Undefined when there is none (TypeScript's tsc is too slow per edit).
+export const checkerFor = (path: string): string[] | undefined => {
+  if (/\.pyi?$/.test(path)) return ['ruff', 'check', '--quiet', '--output-format', 'concise', '--select', 'E9,F63,F7,F82', path]
+  if (/\.(sh|bash)$/.test(path)) return ['bash', '-n', path]
+  if (/\.json$/.test(path)) return ['python3', '-m', 'json.tool', path]
+  return undefined
+}
+
+export type Rule = { name?: string; tool?: string; match: string; flags?: string; rule: string; block?: boolean }
+export type LoadedRule = Rule & { re: RegExp }
+
+// Parses a rules file (a JSON array); entries without a valid `match` regex or `rule` text are dropped.
+export const parseRules = (json: string): LoadedRule[] => {
+  let raw: unknown
+  try { raw = JSON.parse(json) } catch { return [] }
+  if (!Array.isArray(raw)) return []
+  return raw.flatMap((r: Rule) => {
+    if (typeof r?.match !== 'string' || typeof r.rule !== 'string') return []
+    try { return [{ ...r, re: new RegExp(r.match, (r.flags ?? '').replace('g', '')) }] } catch { return [] }
+  })
+}
+
+// The part of a tool call a rule is matched against: what it runs or what it writes.
+export const ruleSubject = (tool: string, input: Record<string, unknown>): string => {
+  if (tool === 'Bash') return String(input.command ?? '')
+  if (tool === 'Edit') return String(input.new_string ?? '')
+  if (tool === 'Write') return String(input.content ?? '')
+  if (tool.endsWith('__HashEdit')) return ((input.edits ?? []) as { text?: string }[]).map(x => x.text ?? '').join('\n')
+  return JSON.stringify(input)
+}
+
+export const matchRules = (rules: readonly LoadedRule[], tool: string, input: Record<string, unknown>): LoadedRule[] => {
+  const subject = ruleSubject(tool, input)
+  return rules.filter(r => (r.tool === undefined || r.tool === tool) && r.re.test(subject))
+}
