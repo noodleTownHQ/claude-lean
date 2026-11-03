@@ -1,6 +1,6 @@
 {
   "name": "lean",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "omp-style token savers and guards: hashline edits, trimmed tool output, a Haiku scout agent, checks after each edit, pattern rules, push and mount guards, and a /lean report",
   "author": {
     "name": "noodleTownHQ"

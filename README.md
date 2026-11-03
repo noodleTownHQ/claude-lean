@@ -2,9 +2,9 @@
 
 A Claude Code mod that borrows [oh-my-pi](https://github.com/can1357/oh-my-pi)'s token savers.
 
-- **Trimmed output.** Bash and Grep output over 10,000 characters (configurable) keeps its head and tail; the full text is saved to `/tmp/claude-lean/<id>.txt` and the output names the file, so Claude reads the middle only when it needs it. Output large enough for Claude Code to save to a file itself is left alone.
+- **Trimmed output.** Bash output (grep and rg included) over 10,000 characters (configurable) keeps its head and tail; the full text is saved to `/tmp/claude-lean/<id>.txt` and the output names the file, so Claude reads the middle only when it needs it. Output large enough for Claude Code to save to a file itself is left alone.
 - **`lean:scout`.** A read-only search agent on Haiku that answers with `path:line` hits instead of file dumps; a short system-prompt note tells Claude to send searches there.
-- **Hashline edits (an experiment).** `HashRead` tags each line `LINE:HASH|text`; `HashEdit` changes lines by those anchors instead of retyping the old text, refuses stale anchors, and runs as an ordinary Edit, so permission prompts and diffs still apply.
+- **Hashline edits (an experiment).** `HashRead` tags each line `LINE:HASH|text`; `HashEdit` changes lines by those anchors instead of retyping the old text, refuses stale anchors, and writes the file once the HashEdit call itself is approved (a nested Edit call would be refused by auto mode, which sees no request behind it); an Edit deny rule for the path still refuses it.
 - **Optional guards** (off by default):
   - *Protected branch:* refuses `git push` to a branch you name (say `main`, where a push deploys). Prefix the command with `LEAN_ALLOW_PUSH=1` for a push you asked for.
   - *Single-file bind mounts:* refuses relative single-file bind mounts in compose YAML under a folder you name. When git replaces such a file, the container keeps the old inode. End a line with `# lean: file-mount-ok` to allow one.

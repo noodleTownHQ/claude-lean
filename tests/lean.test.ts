@@ -138,25 +138,37 @@ describe('hooks', () => {
     expect(r.deny ?? (r.isError === true ? r.text : undefined)).toContain('LEAN_ALLOW_PUSH=1')
   })
 
-  test('HashRead then HashEdit makes one ordinary Edit', async ($, on) => {
-    world(on, { '/repo/a.txt': FILE }, {})
+  test('HashRead then HashEdit writes the file without a nested Edit call', async ($, on) => {
+    const written: Record<string, string> = {}
+    world(on, { '/repo/a.txt': FILE }, written)
     on('tool.call', { tool: 'Read' }, () => ({
       result: { type: 'text', file: { filePath: '/repo/a.txt', content: FILE, numLines: 4, startLine: 1, totalLines: 4 } },
     }))
-    const edits: { old_string: string; new_string: string }[] = []
-    on('tool.call', { tool: 'Edit' }, ($, e) => {
-      edits.push({ old_string: e.old_string, new_string: e.new_string })
-      return { result: { filePath: e.file_path, oldString: e.old_string, newString: e.new_string, originalFile: FILE, structuredPatch: [], userModified: false, replaceAll: false } }
+    let edits = 0
+    on('tool.call', { tool: 'Edit' }, () => {
+      edits++
+      return { deny: 'auto mode: no request behind this call' }
     })
 
     await $.session.start(START)
     const read = await $.tool.call({ tool: 'mcp__lean__HashRead', path: 'a.txt' } as never)
     expect(String((read as { result?: unknown }).result)).toContain(`${at(2)}|beta`)
 
-    const done = await $.tool.call({ tool: 'mcp__lean__HashEdit', path: 'a.txt', edits: [{ start: at(3), text: 'GAMMA' }] } as never)
+    const done = await $.tool.call({ tool: 'mcp__lean__HashEdit', path: 'a.txt', edits: [{ start: at(3), text: 'GAMMA $& $1' }] } as never)
     expect(String((done as { result?: unknown }).result)).toContain('Edited /repo/a.txt')
-    expect(edits.length).toBe(1)
-    expect(FILE.replace(edits[0]!.old_string, edits[0]!.new_string)).toBe('alpha\nbeta\nGAMMA\ndelta\n')
+    expect(edits).toBe(0)
+    expect(written['/repo/a.txt']).toBe('alpha\nbeta\nGAMMA $& $1\ndelta\n')
+  })
+
+  test('HashEdit honours an Edit deny rule', async ($, on) => {
+    const written: Record<string, string> = {}
+    world(on, { '/repo/a.txt': FILE }, written)
+    on('tool.check', () => ({ decision: 'deny', reason: 'protected path' }))
+
+    await $.session.start(START)
+    const done = await $.tool.call({ tool: 'mcp__lean__HashEdit', path: 'a.txt', edits: [{ start: at(3), text: 'X' }] } as never)
+    expect(done.deny ?? (done.isError === true ? done.text : undefined)).toContain('protected path')
+    expect(written['/repo/a.txt']).toBeUndefined()
   })
 })
 
