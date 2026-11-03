@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { On, TurnStepChunk } from 'claude-code'
 
-import { addedFileMounts, checkerFor, hashLine, isGuardedYaml, matchRules, parseRules, planEdit, pushesBranch, tagLines, trimMiddle } from '../hooks/lib'
+import { addedFileMounts, checkerFor, hashLine, isGuardedYaml, matchRules, parseAdvice, parseRules, planEdit, pushesBranch, streamHit, tagLines, trimMiddle } from '../hooks/lib'
 
 const FILE = 'alpha\nbeta\ngamma\ndelta\n'
 const at = (n: number) => `${n}:${hashLine(FILE.split('\n')[n - 1]!)}`
@@ -249,5 +249,97 @@ describe('pattern rules and checks', () => {
     await $.session.start(START)
     await $.tool.call({ tool: 'Edit', file_path: '/repo/a.py', old_string: 'x', new_string: 'y' })
     expect(runs).toBe(0)
+  })
+})
+
+describe('stream rules and the advisor', () => {
+  const STREAM_RULES = JSON.stringify([
+    { name: 'no-leak', match: 'Box::leak', rule: "Don't reach for Box::leak.", stream: true },
+    { match: ':latest', rule: 'tool-call rule' },
+  ])
+  const STEP = { turnId: 't1', index: 0, model: 'opus', messageCount: 3 } as const
+  // Reads a step's stream to its end: its chunks and what it returned.
+  const drain = async (stream: AsyncGenerator<TurnStepChunk, unknown>) => {
+    const chunks: TurnStepChunk[] = []
+    for (;;) {
+      const n = await stream.next()
+      if (n.done) return { chunks, r: n.value as { stopReason: string; toolUses: unknown[] } }
+      chunks.push(n.value)
+    }
+  }
+
+  test('streamHit and matchRules keep stream and tool-call rules apart', () => {
+    const rules = parseRules(STREAM_RULES)
+    expect(streamHit(rules, 'we could Box::leak it', new Set())).toBe(0)
+    expect(streamHit(rules, 'we could Box::leak it', new Set([0]))).toBeUndefined()
+    expect(streamHit(rules, 'image :latest', new Set())).toBeUndefined()
+    expect(matchRules(rules, 'Bash', { command: 'Box::leak' })).toHaveLength(0)
+  })
+
+  test('parseAdvice reads JSON, fenced or not, and treats anything else as none', () => {
+    expect(parseAdvice('```json\n{"level":"concern","note":"Tests were not run."}\n```')).toEqual({ level: 'concern', note: 'Tests were not run.' })
+    expect(parseAdvice('{"level":"weird","note":"x"}').level).toBe('none')
+    expect(parseAdvice('{"level":"blocker","note":""}').level).toBe('none')
+    expect(parseAdvice('looks fine to me').level).toBe('none')
+  })
+
+  test('a stream rule cuts the reply and ends the step with a Rule call', { options: { rulesFile: '/r.json' } }, async ($, on) => {
+    world(on, { '/r.json': STREAM_RULES }, {})
+    on('turn.step', async function* () {
+      yield { kind: 'text', index: 0, text: 'Easiest is ' } as TurnStepChunk
+      yield { kind: 'text', index: 0, text: 'Box::leak(s) here' } as TurnStepChunk
+      yield { kind: 'stop', stopReason: 'end_turn', usage: null } as TurnStepChunk
+      return { turnId: 't1', index: 0, answer: 'Easiest is Box::leak(s) here', toolUses: [], stopReason: 'end_turn', usage: null }
+    })
+    await $.session.start(START)
+
+    const { chunks, r } = await drain($.turn.step(STEP))
+
+    expect(chunks.filter(c => c.kind === 'text').map(c => (c as { text: string }).text)).toEqual(['Easiest is '])
+    expect(chunks.find(c => c.kind === 'tool')).toMatchObject({ name: 'mcp__lean__Rule', index: 1 })
+    expect(r.stopReason).toBe('tool_use')
+    expect(JSON.stringify(r.toolUses)).toContain("Don't reach for Box::leak.")
+
+    const ruled = await $.tool.call({ tool: 'mcp__lean__Rule', rule: 'x' } as never)
+    expect(String((ruled as { result?: unknown }).result)).toContain('Carry on from there')
+  })
+
+  test('with no stream rules a step passes through untouched', async ($, on) => {
+    world(on, {}, {})
+    on('turn.step', async function* () {
+      yield { kind: 'text', index: 0, text: 'Box::leak' } as TurnStepChunk
+      return { turnId: 't1', index: 0, answer: 'Box::leak', toolUses: [], stopReason: 'end_turn', usage: null }
+    })
+    await $.session.start(START)
+    const { chunks, r } = await drain($.turn.step(STEP))
+    expect(r.stopReason).toBe('end_turn')
+    expect(chunks).toHaveLength(1)
+  })
+
+  const adviseWith = (on: On, text: string) => {
+    world(on, {}, {})
+    on('turn.step', async function* () {
+      return { turnId: 't1', index: 0, answer: 'Done, all tests pass.', toolUses: [{ name: 'Edit', input: { file_path: 'a.ts' } }], stopReason: 'end_turn', usage: null }
+    })
+    on('model.complete', () => ({ value: { isAnswered: true, text, usage: {} as never } }))
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('classic.Stop', () => ({}))
+  }
+
+  test('the advisor hands a concern back and keeps the agent going', { options: { advisorModel: 'opus' } }, async ($, on) => {
+    adviseWith(on, '{"level":"concern","note":"It claims tests pass but never ran them."}')
+    await $.session.start(START)
+    await $.turn.start({ text: 'fix the bug and run the tests', turnId: 't1' })
+    await drain($.turn.step(STEP))
+    const r = await $.classic.Stop({ stop_hook_active: false } as never)
+    expect(r.block).toContain('never ran them')
+  })
+
+  test('the advisor stays quiet when it has nothing to say', { options: { advisorModel: 'opus' } }, async ($, on) => {
+    adviseWith(on, '{"level":"none","note":""}')
+    await $.session.start(START)
+    await $.turn.start({ text: 'fix it', turnId: 't1' })
+    await drain($.turn.step(STEP))
+    expect((await $.classic.Stop({ stop_hook_active: false } as never)).block).toBeUndefined()
   })
 })

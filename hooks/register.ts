@@ -1,8 +1,8 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, TurnUsage } from 'claude-code'
+import type { EngineInterface, Register, StreamNext, TurnStepChunk, TurnStepInput, TurnStepResult, TurnUsage } from 'claude-code'
 
 import type { SessionStats, Tally } from '../types'
-import { addedFileMounts, checkerFor, isGuardedYaml, matchRules, parseRules, planEdit, pushesBranch, tagLines, trimMiddle } from './lib'
+import { addedFileMounts, checkerFor, isGuardedYaml, matchRules, parseAdvice, parseRules, planEdit, pushesBranch, streamHit, tagLines, trimMiddle } from './lib'
 import type { HashEditOp, LoadedRule } from './lib'
 
 // Output past `trimChars` (default 10,000) keeps 40% head and 30% tail; the full text goes to OUT_DIR.
@@ -52,6 +52,22 @@ const diagnose = async ($: EngineInterface, path: string): Promise<string | unde
 
 const ruleNote = (r: LoadedRule) => `lean rule${r.name ? ` "${r.name}"` : ''}: ${r.rule}`
 
+const RULE_TOOL = 'mcp__lean__Rule'
+
+// A tool_use id of the API's shape for the call lean makes in Claude's place.
+const toolUseId = () => {
+  const abc = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  const bytes = crypto.getRandomValues(new Uint8Array(24))
+  return `toolu_${Array.from(bytes, b => abc[b % abc.length]).join('')}`
+}
+
+const ADVISOR_PROMPT = `You review another coding agent's turn as it ends. You get the person's request and a log of what the agent said and which tools it called. Look for what the agent rushed past: the request not actually met, a claim the log does not support, a step it said it did but did not, an action that risks data or production, a check it skipped. Ignore style and small things.
+Reply with one JSON object and nothing else: {"level": "none" | "aside" | "concern" | "blocker", "note": "<one or two sentences, addressed to the agent>"}
+- none: the turn is fine (most turns). note "".
+- aside: worth knowing, no action needed.
+- concern: the agent should fix or check something before it stops.
+- blocker: the agent did something wrong or unsafe and must deal with it now.`
+
 const SCOUT_PROMPT = `You are a fast, read-only scout. Find what you were asked to find and report it tersely:
 - one line per hit: path:line, then a few words on what is there
 - then a one to three sentence answer to the question
@@ -69,6 +85,50 @@ const guide = (tools: readonly string[]): string | undefined => {
   return `# Token discipline (lean mod)\n${lines.join('\n')}`
 }
 
+// Stream rules (omp's time-traveling stream rules): when Claude's reply breaks one, the reply stops
+// there and the step ends with a call to Rule instead; its result is the rule, and Claude goes on from
+// that point. Each rule interrupts a turn once.
+async function* ruledStep(
+  $: EngineInterface, e: TurnStepInput, next: StreamNext<'turn.step'>,
+  rules: readonly LoadedRule[], fired: Map<string, Set<number>>,
+): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  const stream = next(e)
+  if (!rules.some(r => r.stream === true)) return yield* stream
+  const done = fired.get(e.turnId) ?? new Set<number>()
+  fired.set(e.turnId, done)
+  const texts = new Map<number, string>()
+  let last = -1
+  for (;;) {
+    const n = await stream.next()
+    if (n.done) return n.value
+    const c = n.value
+    if ('index' in c) last = Math.max(last, c.index)
+    if (c.kind === 'text') {
+      const text = (texts.get(c.index) ?? '') + c.text
+      const hit = streamHit(rules, text, done)
+      if (hit !== undefined) {
+        done.add(hit)
+        await stream.return(undefined as never).catch(() => undefined)
+        await bump($, s => ({ ...s, guards: s.guards + 1 }))
+        const input = { rule: ruleNote(rules[hit]!) }
+        const index = last + 1
+        const chunks: TurnStepChunk[] = [
+          { kind: 'tool', index, id: toolUseId(), name: RULE_TOOL },
+          { kind: 'input', index, json: JSON.stringify(input) },
+          { kind: 'stop', stopReason: 'tool_use', usage: null },
+        ]
+        for (const chunk of chunks) yield chunk
+        return {
+          turnId: e.turnId, index: e.index, answer: [...texts.values()].join(''),
+          toolUses: [{ name: RULE_TOOL, input }], stopReason: 'tool_use' as const, usage: null,
+        }
+      }
+      texts.set(c.index, text)
+    }
+    yield c
+  }
+}
+
 export const register: Register = (on, options) => {
   const branch = String(options.protectBranch ?? '').trim()
   const pushNote = String(options.pushNote ?? '').trim()
@@ -78,6 +138,12 @@ export const register: Register = (on, options) => {
   const TAIL = Math.round(LIMIT * 0.3)
   const rulesFile = String(options.rulesFile ?? '').trim()
   const checks = options.diagnostics !== false
+  const advisorModel = String(options.advisorModel ?? '').trim()
+  // Stream rules fired per turn, by rule index, so a rule interrupts a turn once.
+  const fired = new Map<string, Set<number>>()
+  // The advisor's view of the current request: the person's text and what the agent did since.
+  let request = ''
+  let log: string[] = []
   let hashOn = true
   let cwd = ''
   let rules: LoadedRule[] = []
@@ -151,6 +217,15 @@ export const register: Register = (on, options) => {
       maxTurns: 25,
       omitClaudeMd: true,
     })
+
+    if (rules.some(r => r.stream === true)) {
+      await $.tool.register({
+        name: 'Rule',
+        description: 'Used by the lean mod to hand you a rule when your reply breaks one. Never call it yourself.',
+        inputSchema: { type: 'object', properties: { rule: { type: 'string' } }, required: ['rule'] },
+        isDeferred: false,
+      })
+    }
 
     const mode = hashOn ? 'on' : 'off'
     const life = ((await $.store.get('lifetime')) ?? {}) as Partial<Lifetime>
@@ -303,7 +378,59 @@ export const register: Register = (on, options) => {
     }
   })
 
+  // One turn.step hook: stream rules, then the advisor's log of what the main loop did.
+  on('turn.step', async function* ($, e, next) {
+    const r = yield* ruledStep($, e, next, rules, fired)
+    if (advisorModel !== '' && e.agentId === undefined && r) {
+      if (r.answer) log.push(`agent: ${r.answer}`)
+      for (const t of r.toolUses) log.push(`tool ${t.name}: ${JSON.stringify(t.input).slice(0, 400)}`)
+    }
+    return r
+  })
+
+
+  on('tool.check', { tool: RULE_TOOL }, () => ({ decision: 'allow' }))
+
+  on('tool.call', { tool: RULE_TOOL }, async ($, e) => {
+    const { rule } = e as unknown as { rule?: string }
+    return { result: `${rule ?? 'lean rule'}\nYour reply was cut where it broke this rule. Carry on from there, following it.` }
+  })
+
+  // The advisor (omp's advisor role): a second model reads each finished turn of the main loop and,
+  // for a concern or a blocker, hands the agent its note and keeps it going. Off unless advisorModel is set.
+  if (advisorModel !== '') {
+    on('turn.start', async ($, e, next) => {
+      if (e.agentId === undefined && e.text !== '') {
+        request = e.text
+        log = []
+      }
+      return next(e)
+    })
+
+    on('classic.Stop', async ($, e, next) => {
+      const done = await next(e)
+      if (done.block !== undefined || e.stop_hook_active || request === '' || log.length === 0) return done
+      const transcript = log.join('\n')
+      const reply = await $.model.complete({
+        model: advisorModel,
+        system: ADVISOR_PROMPT,
+        prompt: `Request:\n${request.slice(0, 4_000)}\n\nWhat the agent did (latest last):\n${transcript.slice(-12_000)}`,
+        maxTokens: 400,
+        timeoutMs: 60_000,
+      })
+      if (!reply.isAnswered) return done
+      const advice = parseAdvice(reply.text)
+      if (advice.level === 'none') return done
+      if (advice.level === 'aside') {
+        $.ui.toast(`Advisor: ${advice.note}`)
+        return done
+      }
+      return { ...done, block: `Advisor (${advisorModel}, ${advice.level}): ${advice.note}\nDeal with this, or say plainly why you won't, then finish.` }
+    }).catch(($, e, next) => next(e))
+  }
+
   on('turn.complete', async ($, e, next) => {
+    fired.delete(e.turnId)
     const done = await next(e)
     const u = e.usage
     if (!u) return done

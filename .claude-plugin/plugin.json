@@ -1,6 +1,6 @@
 {
   "name": "lean",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "omp-style token savers and guards: hashline edits, trimmed tool output, a Haiku scout agent, checks after each edit, pattern rules, push and mount guards, and a /lean report",
   "author": {
     "name": "noodleTownHQ"
@@ -13,6 +13,12 @@
       "title": "Check files after each edit",
       "description": "After Edit, Write or HashEdit, run a fast checker for the file type (ruff for Python syntax and undefined names, bash -n, JSON parse) and hand Claude any errors",
       "default": true
+    },
+    "advisorModel": {
+      "type": "string",
+      "title": "Advisor model",
+      "description": "A second model (an alias such as opus or sonnet, or a full id) that reviews each finished turn and hands the agent a concern or blocker before it stops. Costs one extra request per turn. Empty turns the advisor off",
+      "default": ""
     },
     "rulesFile": {
       "type": "string",

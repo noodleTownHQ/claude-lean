@@ -188,7 +188,8 @@ export const checkerFor = (path: string): string[] | undefined => {
   return undefined
 }
 
-export type Rule = { name?: string; tool?: string; match: string; flags?: string; rule: string; block?: boolean }
+// `stream: true` matches Claude's reply as it streams; otherwise a rule matches tool calls.
+export type Rule = { name?: string; tool?: string; match: string; flags?: string; rule: string; block?: boolean; stream?: boolean }
 export type LoadedRule = Rule & { re: RegExp }
 
 // Parses a rules file (a JSON array); entries without a valid `match` regex or `rule` text are dropped.
@@ -213,5 +214,26 @@ export const ruleSubject = (tool: string, input: Record<string, unknown>): strin
 
 export const matchRules = (rules: readonly LoadedRule[], tool: string, input: Record<string, unknown>): LoadedRule[] => {
   const subject = ruleSubject(tool, input)
-  return rules.filter(r => (r.tool === undefined || r.tool === tool) && r.re.test(subject))
+  return rules.filter(r => r.stream !== true && (r.tool === undefined || r.tool === tool) && r.re.test(subject))
+}
+
+// The first stream rule `text` breaks that has not fired yet (`fired` holds the indexes of those that have).
+export const streamHit = (rules: readonly LoadedRule[], text: string, fired: ReadonlySet<number>): number | undefined => {
+  const i = rules.findIndex((r, n) => r.stream === true && !fired.has(n) && r.re.test(text))
+  return i === -1 ? undefined : i
+}
+
+export type Advice = { level: 'none' | 'aside' | 'concern' | 'blocker'; note: string }
+
+// The advisor's reply: a JSON object, possibly fenced or with prose around it; anything else is no advice.
+export const parseAdvice = (reply: string): Advice => {
+  const m = /\{[\s\S]*\}/.exec(reply)
+  try {
+    const a = JSON.parse(m?.[0] ?? '') as Partial<Advice>
+    const level = ['aside', 'concern', 'blocker'].includes(String(a.level)) ? a.level! : 'none'
+    const note = typeof a.note === 'string' ? a.note.trim() : ''
+    return note === '' ? { level: 'none', note: '' } : { level, note }
+  } catch {
+    return { level: 'none', note: '' }
+  }
 }
